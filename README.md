@@ -23,5 +23,13 @@ Example:
 microgrid-code/data/prices.csv
 microgrid-code/data/load_profiles.csv
 
+## Normal Workflow
 
+```bash
+git pull
+# work on code / notebooks
+git add .
+git commit -m "Describe what you changed"
+git push
 
+```
