@@ -1,0 +1,258 @@
+import numpy as np
+from pathlib import Path
+import pandas as pd
+from os.path import join
+import glob
+#from windrose import WindroseAxes
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.lines as mlines
+from matplotlib.legend_handler import HandlerTuple
+from matplotlib.ticker import FuncFormatter
+from scipy import stats
+
+# ----------------------------------------------------------------------------
+# Question 10: Plot raw data and identify gaps
+# ----------------------------------------------------------------------------
+
+def load_10min_data(path: str) -> pd.DataFrame:
+    """Load and parse the 10-minute mean CSV."""
+    df = pd.read_csv(path, sep=",")
+    df["timestamp"] = pd.to_datetime(df["Name"].astype(str), format="%Y%m%d%H%M")
+    df = df.set_index("timestamp").drop(columns=["Name"]).sort_index()
+    return df
+
+
+
+def remove_wind_outliers(df: pd.DataFrame) -> pd.DataFrame:
+    """Cap physically unreasonable wind speeds."""
+    wind_cols = [c for c in df.columns if "Wsp" in c or "SWsp" in c]
+    total_outliers = 0
+    for col in wind_cols:
+        mask = df[col] > MAX_WIND_SPEED
+        mask |= df[col] < 0
+        total_outliers += mask.sum()
+        df.loc[mask, col] = np.nan
+    print(f"  Total wind speed outliers removed: {total_outliers}")
+    return df
+
+
+def remove_stuck_values(df: pd.DataFrame, window: int = STUCK_WINDOW) -> pd.DataFrame:
+    """
+    If a sensor reports the exact same value for `window` consecutive records,
+    mark those readings as NaN (frozen / stuck sensor).
+    Applied to wind speed and direction columns.
+    """
+    cols = [c for c in df.columns if "Wsp" in c or "SWsp" in c
+            or "dir" in c or "Dir" in c]
+    for col in cols:
+        s = df[col]
+        is_same = s.diff().eq(0)
+        streak = is_same.groupby((~is_same).cumsum()).cumsum()
+        stuck_mask = streak >= (window - 1)
+        for shift in range(1, window):
+            stuck_mask = stuck_mask | stuck_mask.shift(-shift, fill_value=False)
+        df.loc[stuck_mask, col] = np.nan
+    return df
+
+
+def clean_10min(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply all cleaning steps to the 10-min dataset."""
+    df = remove_wind_outliers(df.copy())
+    df = remove_stuck_values(df)
+    return df
+
+
+def _year_locator_formatter(ax):
+    """Standard x-axis formatting for multi-year plots."""
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.tick_params(axis="x", rotation=45)
+
+
+def plot_wind_speed_q10(df: pd.DataFrame, height: int, fname: str):
+    """Two-panel figure: cup anemometer on top, sonic anemometer below."""
+    cup_col = f"Wsp_{height}m"
+    sonic_col = f"SWsp_{height}m"
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 6), sharex=True, sharey=True)
+
+    ax1.scatter(df.index, df[cup_col], s=0.05, alpha=0.4, color="tab:blue", rasterized=True)
+    ax1.set_ylabel("Wind speed [m/s]")
+    ax1.set_title(f"Cup anemometer -- {height} m")
+    ax1.set_ylim(0, 30)
+    ax1.grid(True, alpha=0.3)
+
+    ax2.scatter(df.index, df[sonic_col], s=0.05, alpha=0.4, color="tab:orange", rasterized=True)
+    ax2.set_ylabel("Wind speed [m/s]")
+    ax2.set_title(f"Sonic anemometer -- {height} m")
+    ax2.set_ylim(0, 30)
+    ax2.grid(True, alpha=0.3)
+    _year_locator_formatter(ax2)
+
+    fig.suptitle(f"10-min mean wind speed at {height} m (2018--2025)", fontsize=13, y=1.01)
+    fig.tight_layout()
+    fig.savefig(f"{FIG_DIR}/{fname}", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {fname}")
+
+
+def plot_direction_q10(df: pd.DataFrame, col: str, label: str, fname: str):
+    fig, ax = plt.subplots(figsize=(14, 3.5))
+    ax.scatter(df.index, df[col], s=0.05, alpha=0.3, color="tab:green", rasterized=True)
+    ax.set_ylabel("Direction [deg]")
+    ax.set_ylim(0, 360)
+    ax.set_yticks([0, 90, 180, 270, 360])
+    ax.set_title(label)
+    ax.grid(True, alpha=0.3)
+    _year_locator_formatter(ax)
+    fig.tight_layout()
+    fig.savefig(f"{FIG_DIR}/{fname}", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {fname}")
+
+
+def plot_rain_q10(df: pd.DataFrame, fname: str):
+    fig, ax = plt.subplots(figsize=(14, 3.5))
+    ax.scatter(df.index, df["Rain"], s=0.05, alpha=0.4, color="tab:cyan", rasterized=True)
+    ax.set_ylabel("Precipitation [mm]")
+    ax.set_title("10-min precipitation (2018--2025)")
+    ax.grid(True, alpha=0.3)
+    _year_locator_formatter(ax)
+    fig.tight_layout()
+    fig.savefig(f"{FIG_DIR}/{fname}", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {fname}")
+
+
+def find_timestamp_gaps(df: pd.DataFrame) -> pd.DataFrame:
+    """Find gaps where consecutive records are more than 10 minutes apart."""
+    dt = df.index.to_series().diff()
+    expected = pd.Timedelta(minutes=10)
+    gap_mask = dt > expected
+    gaps = pd.DataFrame({
+        "start": df.index[:-1][gap_mask.values[1:]],
+        "end": df.index[1:][gap_mask.values[1:]],
+    })
+    gaps["duration"] = gaps["end"] - gaps["start"]
+    return gaps.reset_index(drop=True)
+
+
+def find_sensor_gaps(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    """Find contiguous NaN blocks for a specific sensor column."""
+    is_nan = df[col].isna()
+    block_id = (~is_nan).cumsum()
+    nan_blocks = is_nan[is_nan].groupby(block_id[is_nan])
+    rows = []
+    for _, block in nan_blocks:
+        rows.append({
+            "start": block.index[0],
+            "end": block.index[-1],
+            "duration": block.index[-1] - block.index[0] + pd.Timedelta(minutes=10),
+        })
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["start", "end", "duration"])
+
+
+def plot_global_gaps(df: pd.DataFrame, gaps: pd.DataFrame, fname: str):
+    """Horizontal availability bars per sensor channel."""
+    sensor_cols = ["Wsp_70m", "SWsp_70m", "Wsp_57m", "SWsp_57m",
+                   "Sdir_70m", "Sdir_57m", "Wdir_41m", "Rain"]
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+
+    for i, col in enumerate(sensor_cols):
+        ax.barh(i, width=(df.index[-1] - df.index[0]).days,
+                left=mdates.date2num(df.index[0]),
+                height=0.6, color="tab:green", alpha=0.35)
+
+        sgaps = find_sensor_gaps(df, col)
+        if not sgaps.empty:
+            sgaps_long = sgaps[sgaps["duration"] >= pd.Timedelta(hours=1)]
+            for _, g in sgaps_long.iterrows():
+                ax.barh(i,
+                        width=(g["end"] - g["start"]).total_seconds() / 86400,
+                        left=mdates.date2num(g["start"]),
+                        height=0.6, color="tab:red", alpha=0.7)
+
+    ax.set_yticks(range(len(sensor_cols)))
+    ax.set_yticklabels(sensor_cols)
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.set_title("Data availability per sensor channel (red = missing data > 1 h)")
+    ax.set_xlabel("Year")
+    ax.grid(True, axis="x", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(f"{FIG_DIR}/{fname}", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {fname}")
+
+
+def plot_gap_histogram(gaps: pd.DataFrame, fname: str):
+    """Distribution of timestamp-gap durations on a log-log scale."""
+    durations_hours = gaps["duration"].dt.total_seconds() / 3600
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    bins = np.logspace(np.log10(durations_hours.min()),
+                       np.log10(durations_hours.max()), 40)
+    ax.hist(durations_hours, bins=bins, edgecolor="black", alpha=0.7, color="tab:purple")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_ylabel("Count")
+    ax.set_title("Distribution of timestamp gap durations (log scale)")
+    ax.grid(True, alpha=0.3)
+
+    # Tick labels with human-readable units (minutes < 1h, hours >= 1h)
+    tick_values = [0.2, 0.5, 1, 2, 5, 10, 24, 48]
+    tick_values = [v for v in tick_values
+                   if durations_hours.min() * 0.9 <= v <= durations_hours.max() * 1.1]
+    tick_labels = []
+    for v in tick_values:
+        if v < 1:
+            tick_labels.append(f"{v * 60:.0f} min")
+        else:
+            tick_labels.append(f"{v:g} h")
+    ax.set_xticks(tick_values)
+    ax.set_xticklabels(tick_labels)
+    ax.xaxis.set_minor_formatter(FuncFormatter(lambda x, _: ""))
+    ax.set_xlabel("Gap duration")
+
+    fig.tight_layout()
+    fig.savefig(f"{FIG_DIR}/{fname}", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {fname}")
+
+
+# Load, clean, and plot
+print("Q10: Loading 10-min data...")
+df_10min_raw = load_10min_data("data/tenMinutesData_2018_2025.csv")
+print(f"  Loaded {len(df_10min_raw)} rows, {df_10min_raw.index.min()} to {df_10min_raw.index.max()}")
+
+print("Q10: Cleaning data...")
+df_10min = clean_10min(df_10min_raw)
+n_removed = df_10min_raw.notna().sum().sum() - df_10min.notna().sum().sum()
+print(f"  Total values removed: {n_removed}")
+
+# Per-channel missing data percentages (for report verification)
+print("Q10: Missing data per channel (after cleaning):")
+for col in df_10min.columns:
+    pct = df_10min[col].isna().mean() * 100
+    print(f"  {col}: {pct:.1f}%")
+
+print("Q10: Plotting time series...")
+plot_wind_speed_q10(df_10min, 70, "Q10_Wsp_70m.png")
+plot_wind_speed_q10(df_10min, 57, "Q10_Wsp_57m.png")
+plot_direction_q10(df_10min, "Sdir_70m", "Sonic wind direction at 70 m (2018--2025)", "Q10_Dir_70m.png")
+plot_direction_q10(df_10min, "Sdir_57m", "Sonic wind direction at 57 m (2018--2025)", "Q10_Dir_57m.png")
+plot_direction_q10(df_10min, "Wdir_41m", "Wind vane direction at 41 m (2018--2025)", "Q10_Dir_41m.png")
+plot_rain_q10(df_10min, "Q10_Rain.png")
+
+print("Q10: Analyzing gaps...")
+gaps_10min = find_timestamp_gaps(df_10min)
+long_gaps = gaps_10min[gaps_10min["duration"] >= pd.Timedelta(hours=3)]
+print(f"  Total timestamp gaps: {len(gaps_10min)}")
+print(f"  Gaps > 3 hours: {len(long_gaps)}")
+print(f"  Shortest gap: {gaps_10min['duration'].min()}")
+print(f"  Longest gap: {gaps_10min['duration'].max()}")
+plot_global_gaps(df_10min, gaps_10min, "Q10_Global_Gaps.png")
+if not gaps_10min.empty:
+    plot_gap_histogram(gaps_10min, "Q10_Gap_Histogram.png")
